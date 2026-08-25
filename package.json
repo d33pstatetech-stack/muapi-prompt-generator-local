@@ -1,0 +1,15 @@
+{
+  "name": "muapi-prompt-generator-local",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MuAPI Prompt Generator — local, browser-only version (no Cloudflare). File-based catalog + update/sync.",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "build:catalog": "node scripts/build-catalog.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
