@@ -205,7 +205,7 @@ async function handleApi(req, res, pathname, query) {
     const model = catalog.models.find((m) => m.id === modelId);
     if (!model) return json(res, { error: 'Model not found in catalog' }, 404);
 
-    const apiBody = buildApiBody(userParams || {});
+    const apiBody = buildApiBody(modelId, userParams || {});
     const apiUrl = model.endpoint.startsWith('http') ? model.endpoint : `https://api.muapi.ai${model.endpoint}`;
 
     let apiRes;
@@ -285,14 +285,14 @@ async function handleApi(req, res, pathname, query) {
       return json(res, { estimatedCost: model.cost, currency: model.cost_currency, source: 'catalog' });
     }
     if (model.estimate_endpoint) {
-      try {
+        try {
         const apiRes = await fetch(`https://api.muapi.ai${model.estimate_endpoint}`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             ...(MUAPI_API_KEY ? { 'x-api-key': MUAPI_API_KEY } : {}),
           },
-          body: JSON.stringify(buildApiBody(body.params || {})),
+          body: JSON.stringify(buildApiBody(body.modelId, body.params || {})),
         });
         if (apiRes.ok) return json(res, { ...(await apiRes.json()), source: 'api' });
       } catch { /* fall through */ }
@@ -303,16 +303,37 @@ async function handleApi(req, res, pathname, query) {
   return json(res, { error: 'Not found' }, 404);
 }
 
-// ── Build API request body from user params (same mapping as CF worker) ──
-function buildApiBody(params) {
+// ── Build API request body — generic, per-model capability-aware ──
+function buildApiBody(modelId, params) {
+  const model = catalog ? catalog.models.find((m) => m.id === modelId) : null;
+  const schemaParams = model && model.params ? model.params : null;
   const body = {};
-  const ints = ['width', 'height', 'num_images', 'stylize', 'chaos', 'weird', 'seed'];
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined || v === '' || (Array.isArray(v) && v.length === 0)) continue;
-    if (k === 'duration') body.duration = typeof v === 'string' ? parseInt(v, 10) : v;
-    else if (ints.includes(k)) body[k] = parseInt(v, 10);
-    else if (k === 'images_list') body.images_list = Array.isArray(v) ? v : [v];
-    else body[k] = v;
+    const spec = schemaParams ? schemaParams[k] : null;
+    if (spec) {
+      if (spec.type === 'number') {
+        const n = typeof v === 'string' ? Number(v) : v;
+        if (!Number.isNaN(n)) body[k] = n;
+        continue;
+      }
+      if (spec.type === 'boolean') {
+        body[k] = v === true || v === 'true' || v === 1 || v === '1';
+        continue;
+      }
+      if (spec.type === 'array' && !Array.isArray(v)) { body[k] = [v]; continue; }
+    } else {
+      if (['width', 'height', 'num_images', 'stylize', 'chaos', 'weird', 'seed'].includes(k)) {
+        const n = parseInt(v, 10);
+        if (!Number.isNaN(n)) { body[k] = n; continue; }
+      }
+      if (k === 'duration' && typeof v === 'string') {
+        const n = parseInt(v, 10);
+        if (!Number.isNaN(n)) { body[k] = n; continue; }
+      }
+      if (k === 'images_list' && !Array.isArray(v)) { body[k] = [v]; continue; }
+    }
+    body[k] = v;
   }
   body.webhook_url = null;
   return body;
