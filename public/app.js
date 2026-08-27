@@ -15,6 +15,15 @@ let history = [];
 let uploadTarget = null; // which param the upload modal is targeting
 let uploadedImages = {}; // param_name → url or [urls]
 
+// Expose for enhancer.js (which loads after this file, shares same global lexical scope via window)
+try {
+  Object.defineProperty(window, 'currentModel', { get: () => currentModel, set: (v) => { currentModel = v; }, configurable: true });
+  Object.defineProperty(window, 'currentParams', { get: () => currentParams, set: (v) => { currentParams = v; }, configurable: true });
+  Object.defineProperty(window, 'currentSchema', { get: () => currentSchema, set: (v) => { currentSchema = v; }, configurable: true });
+  Object.defineProperty(window, 'allModels', { get: () => allModels, configurable: true });
+  window.updatePayloadPreview = updatePayloadPreview; // defined later, will be overwritten — ensure global
+} catch {}
+
 // ── Templates ──
 const TEMPLATES = [
   { name: 'Product Photo', icon: 'fa-box', prompt: 'Professional product photography of [subject], clean white background, studio lighting, soft shadows, commercial quality, 8k', model: 'flux-kontext-max-t2i', params: { aspect_ratio: '1:1' } },
@@ -43,7 +52,6 @@ async function loadModels() {
     allModels = data.models || [];
     filterByGroup();
     setConnectionStatus(true);
-    // Update header stats from health
     try {
       const h = await fetch(`${API}/health`).then((r) => r.json());
       const hc = document.getElementById('headerModelCount');
@@ -53,6 +61,10 @@ async function loadModels() {
         const d = new Date(h.synced_at);
         hs.textContent = `synced ${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
         hs.title = h.synced_at;
+      } else if (hs && h.timestamp) {
+        const d = new Date(h.timestamp);
+        hs.textContent = `synced ${d.toLocaleDateString()}`;
+        hs.title = h.timestamp;
       }
     } catch { /* ignore */ }
   } catch (e) {
@@ -68,10 +80,8 @@ async function syncCatalog() {
   try {
     const res = await fetch(`${API}/sync`, { method: 'POST' });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Sync failed');
-    // Reload catalog
+    if (!res.ok) throw new Error(data.error || data.message || 'Sync failed');
     await loadModels();
-    // Re-select current model to refresh params
     if (currentModel) await selectModel(currentModel.id);
     const msg = data.added > 0
       ? `Updated: ${data.total} models (+${data.added} new)` + (data.with_params ? `, ${data.with_params} with params` : '')
