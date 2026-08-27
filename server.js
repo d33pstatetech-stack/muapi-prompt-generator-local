@@ -34,6 +34,14 @@ const MUAPI_API_KEY = process.env.MUAPI_API_KEY || '';
 const MUAPI_BASE = (process.env.MUAPI_BASE_URL || 'https://api.muapi.ai/api/v1').replace(/\/$/, '');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const CATALOG_PATH = path.join(__dirname, 'data', 'catalog.json');
+const LLM_CONFIG_PATH = path.join(__dirname, 'data', 'llm.json');
+const PROMPTS_PATH = path.join(__dirname, 'data', 'prompts.json');
+
+const DEFAULT_LLM_PROVIDERS = [
+  { baseUrl: 'https://openrouter.ai/api/v1', model: 'cognitivecomputations/dolphin-mistral-24b-venice-edition:free', apiKey: '' },
+  { baseUrl: 'https://openrouter.ai/api/v1', model: 'openrouter/free', apiKey: '' },
+];
+const ENHANCER_TEMPLATE = `refine the following [Media Generation Type] prompt, specifically to optimize it for [Model]. This should include determining the optimal prompt length, or at least the ideal minimum and maximum word counts, determining whether the model excels with keyword based prompts or full narrative descriptions, what types of prompts work best (describe everything vs just describe movement, etc), whether it accepts timestamp direction (at 00:05, do this, at 00:10 do that, etc) and if it does add these timestamp directions based on the total length of the video (as input by the user) and estimating the time it would take for the described actions in the scene to take place, determine if a certain camera lens or videography style works well if called out for the specific model, translate any vague camera movement directions into videographer jargon (dolly out, orbital, chase cam, etc).  The video will be generated at [resolution] and [aspect ratio] (only include this if it would benefit the prompt for this model.  \nif [Model] includes audio generation, insert appropriate sound effect cues and format any dialogue into the most AI friendly format.`;
 
 // ── Catalog ──
 let catalog = null;
@@ -57,6 +65,73 @@ function loadCatalog() {
       console.error('Check your internet connection and restart.');
       process.exit(1);
     });
+}
+
+// ── Enhancer helpers (shared logic with Worker) ──
+function hasDialogueCues(s) {
+  return /["\u201c\u201d].*["\u201c\u201d]|dialogue|says\s+["\u201c]|speaking|voice:/i.test(s);
+}
+function deriveMediaTypeLocal(model) {
+  if (!model) return 'text-to-video';
+  const id = model.id || '';
+  const cat = (model.category || '').toLowerCase();
+  if (id.includes('reference-to-video')) return 'reference-to-video';
+  if (id.includes('image-to-video') || id.includes('-i2v') || id.includes('i2v')) return 'image-to-video';
+  if (id.includes('text-to-video') || id.includes('-t2v')) return 'text-to-video';
+  if (id.includes('image-to-image') || id.includes('-i2i') || cat.includes('image to image')) return 'image-to-image';
+  if (cat.includes('text to image')) return 'text-to-image';
+  if (cat.includes('video to video') || cat.includes('video: edit')) return 'video-to-video';
+  if (cat.includes('audio')) return 'audio generation';
+  if (cat.includes('3d')) return 'text-to-3d';
+  return cat.replace(/ /g, '-') || 'text-to-video';
+}
+function buildEnhancerSystemPrompt(raw, ctx) {
+  let t = ENHANCER_TEMPLATE.replace('[Media Generation Type]', ctx.mediaType).replace('[Model]', ctx.model);
+  const resAspect = [];
+  if (ctx.resolution) resAspect.push(ctx.resolution);
+  if (ctx.aspectRatio) resAspect.push(ctx.aspectRatio);
+  if (resAspect.length) {
+    t = t.replace('[resolution] and [aspect ratio]', resAspect.join(' and '));
+  } else {
+    t = t.replace(/The video will be generated at \[resolution\] and \[aspect ratio\][^\n]*\n?/, '');
+  }
+  if (!ctx.hasAudio) {
+    t = t.replace(/if \[Model\] includes audio generation,.*format\./, '').trim();
+  } else {
+    t = t.replace(/\[Model\]/g, ctx.model);
+  }
+  if (!hasDialogueCues(raw)) {
+    t = t.replace(/and format any dialogue into the most AI friendly format\./, ' (dialogue formatting not needed for this prompt).');
+  }
+  if (ctx.duration && ctx.mediaType.includes('video')) {
+    t += `\nVideo length: ${ctx.duration} seconds — add timestamp directions accordingly.`;
+  }
+  return t;
+}
+function getLLMConfigLocal() {
+  try {
+    if (fs.existsSync(LLM_CONFIG_PATH)) {
+      const j = JSON.parse(fs.readFileSync(LLM_CONFIG_PATH, 'utf-8'));
+      if (j.providers && j.providers.length) return j;
+    }
+  } catch {}
+  const envKey = process.env.OPENROUTER_API_KEY || '';
+  return { providers: DEFAULT_LLM_PROVIDERS.map((p) => ({ ...p, apiKey: envKey || p.apiKey })) };
+}
+function redactLLM(cfg) {
+  return { providers: (cfg.providers || []).map((p) => ({ ...p, apiKey: p.apiKey ? '***' : '' })) };
+}
+function loadPrompts() {
+  try {
+    if (fs.existsSync(PROMPTS_PATH)) return JSON.parse(fs.readFileSync(PROMPTS_PATH, 'utf-8'));
+  } catch {}
+  return [];
+}
+function savePrompts(arr) {
+  try {
+    fs.mkdirSync(path.dirname(PROMPTS_PATH), { recursive: true });
+    fs.writeFileSync(PROMPTS_PATH, JSON.stringify(arr.slice(0, 500)));
+  } catch {}
 }
 
 // ── Helpers ──
