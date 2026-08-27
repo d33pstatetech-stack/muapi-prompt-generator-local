@@ -300,6 +300,127 @@ async function handleApi(req, res, pathname, query) {
     return json(res, { estimatedCost: model.cost, currency: model.cost_currency, source: 'catalog_fallback' });
   }
 
+  // LLM config
+  if (pathname === '/api/llm-config' && req.method === 'GET') {
+    return json(res, { config: redactLLM(getLLMConfigLocal()) });
+  }
+  if (pathname === '/api/llm-config' && req.method === 'PUT') {
+    let body;
+    try { body = JSON.parse((await readBody(req)).toString() || '{}'); } catch { return json(res, { error: 'Invalid JSON' }, 400); }
+    const incoming = body.config;
+    if (!incoming || !Array.isArray(incoming.providers) || !incoming.providers.length) {
+      return json(res, { error: 'config.providers must be a non-empty array' }, 400);
+    }
+    const existing = getLLMConfigLocal();
+    const providers = incoming.providers.map((p, i) => {
+      let apiKey = (p.apiKey || '').trim();
+      if (apiKey === '***' && existing.providers[i]) apiKey = existing.providers[i].apiKey;
+      if (!p.model || !p.model.trim()) return null;
+      return { baseUrl: (p.baseUrl || 'https://openrouter.ai/api/v1').trim().replace(/\/$/, ''), model: p.model.trim(), apiKey };
+    }).filter(Boolean);
+    if (!providers.length) return json(res, { error: 'At least one provider with a model is required' }, 400);
+    const toSave = { providers };
+    try { fs.mkdirSync(path.dirname(LLM_CONFIG_PATH), { recursive: true }); fs.writeFileSync(LLM_CONFIG_PATH, JSON.stringify(toSave)); } catch {}
+    return json(res, { ok: true, config: redactLLM(toSave) });
+  }
+
+  // Enhance (streaming)
+  if (pathname === '/api/enhance' && req.method === 'POST') {
+    let body;
+    try { body = JSON.parse((await readBody(req)).toString() || '{}'); } catch { return json(res, { error: 'Invalid JSON' }, 400); }
+    const rawPrompt = (body.rawPrompt || '').trim();
+    const modelId = (body.modelId || '').trim();
+    const userParams = body.params || {};
+    if (!rawPrompt) return json(res, { error: 'rawPrompt is required' }, 400);
+    if (!modelId) return json(res, { error: 'modelId is required' }, 400);
+    const model = catalog.models.find((m) => m.id === modelId);
+    if (!model) return json(res, { error: 'Model not found' }, 404);
+    const mediaType = deriveMediaTypeLocal(model);
+    const aspectRatio = userParams.aspect_ratio || null;
+    const resolution = userParams.resolution || (userParams.width && userParams.height ? `${userParams.width}x${userParams.height}` : null) || null;
+    const duration = userParams.duration || null;
+    const hasAudio = !!(model.id.includes('seedance') || model.id.includes('wan') || model.family === 'seedance' || model.group_of === 'audio' || model.id.includes('audio'));
+    const ctx = { model: model.id, mediaType, aspectRatio, resolution, duration, hasAudio };
+    const systemPrompt = buildEnhancerSystemPrompt(rawPrompt, ctx);
+    const llmCfg = getLLMConfigLocal();
+    let lastErr = null;
+    for (const p of llmCfg.providers) {
+      const baseUrl = (p.baseUrl || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
+      const apiKey = p.apiKey || process.env.OPENROUTER_API_KEY || '';
+      if (!apiKey) { lastErr = 'Missing API key for ' + p.model; continue; }
+      let llmRes;
+      try {
+        llmRes = await fetch(`${baseUrl}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+            'HTTP-Referer': 'http://localhost:3000',
+            'X-Title': 'MuAPI Prompt Generator Local',
+          },
+          body: JSON.stringify({ model: p.model, stream: true, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: `Raw prompt: """${rawPrompt}"""` }] }),
+        });
+      } catch (e) { lastErr = e.message; continue; }
+      if (!llmRes.ok) {
+        const txt = await llmRes.text().catch(() => '');
+        let j = null; try { j = JSON.parse(txt); } catch { j = null; }
+        lastErr = (j && (j.error?.message || j.error)) || txt || `HTTP ${llmRes.status}`;
+        continue;
+      }
+      // Stream to client
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'Access-Control-Allow-Origin': '*',
+        'X-Provider-Used': baseUrl,
+        'X-Model-Used': p.model,
+      });
+      let fullEnhanced = '';
+      const reader = llmRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            if (fullEnhanced) {
+              try { const arr = loadPrompts(); arr.unshift({ id: Date.now(), kind: 'enhanced', prompt: rawPrompt, enhanced: fullEnhanced, model_id: model.id, params_json: JSON.stringify(userParams), llm_provider: baseUrl, llm_model: p.model, created_at: new Date().toISOString() }); savePrompts(arr); } catch {}
+            }
+            res.write('data: [DONE]\n\n');
+            res.end();
+            return;
+          }
+          res.write(value);
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const d = line.slice(6).trim();
+            if (d === '[DONE]' || !d) continue;
+            try { const j = JSON.parse(d); const delta = j.choices?.[0]?.delta?.content || ''; if (delta) fullEnhanced += delta; } catch {}
+          }
+        }
+      } catch (e) {
+        try { res.end(); } catch {}
+      }
+      return;
+    }
+    return json(res, { error: 'All LLM providers failed', message: String(lastErr || 'unknown') }, 502);
+  }
+
+  // Prompts list
+  if (pathname === '/api/prompts' && req.method === 'GET') {
+    const kind = query.get('kind') || 'enhanced';
+    const limit = Math.min(parseInt(query.get('limit') || '50', 10), 200);
+    try {
+      const all = loadPrompts();
+      const filtered = kind === 'all' ? all : all.filter((p) => p.kind === kind);
+      return json(res, { prompts: filtered.slice(0, limit), total: filtered.length });
+    } catch { return json(res, { prompts: [], total: 0 }); }
+  }
+
   return json(res, { error: 'Not found' }, 404);
 }
 
