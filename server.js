@@ -38,7 +38,7 @@ const LLM_CONFIG_PATH = path.join(__dirname, 'data', 'llm.json');
 const PROMPTS_PATH = path.join(__dirname, 'data', 'prompts.json');
 
 const DEFAULT_LLM_PROVIDERS = [
-  { baseUrl: 'https://openrouter.ai/api/v1', model: 'cognitivecomputations/dolphin-mistral-24b-venice-edition:free', apiKey: '' },
+  { baseUrl: 'https://api.venice.ai/api/v1', model: 'dolphin-mixtral', apiKey: '' },
   { baseUrl: 'https://openrouter.ai/api/v1', model: 'openrouter/free', apiKey: '' },
 ];
 const ENHANCER_TEMPLATE = `refine the following [Media Generation Type] prompt, specifically to optimize it for [Model]. This should include determining the optimal prompt length, or at least the ideal minimum and maximum word counts, determining whether the model excels with keyword based prompts or full narrative descriptions, what types of prompts work best (describe everything vs just describe movement, etc), whether it accepts timestamp direction (at 00:05, do this, at 00:10 do that, etc) and if it does add these timestamp directions based on the total length of the video (as input by the user) and estimating the time it would take for the described actions in the scene to take place, determine if a certain camera lens or videography style works well if called out for the specific model, translate any vague camera movement directions into videographer jargon (dolly out, orbital, chase cam, etc).  The video will be generated at [resolution] and [aspect ratio] (only include this if it would benefit the prompt for this model.  \nif [Model] includes audio generation, insert appropriate sound effect cues and format any dialogue into the most AI friendly format.`;
@@ -115,8 +115,15 @@ function getLLMConfigLocal() {
       if (j.providers && j.providers.length) return j;
     }
   } catch {}
-  const envKey = process.env.OPENROUTER_API_KEY || '';
-  return { providers: DEFAULT_LLM_PROVIDERS.map((p) => ({ ...p, apiKey: envKey || p.apiKey })) };
+  const veniceKey = process.env.VENICE_API_KEY || '';
+  const openrouterKey = process.env.OPENROUTER_API_KEY || '';
+  return {
+    providers: DEFAULT_LLM_PROVIDERS.map((p) => {
+      const isVenice = (p.baseUrl || '').includes('venice.ai');
+      const envKey = isVenice ? veniceKey : openrouterKey;
+      return { ...p, apiKey: envKey || p.apiKey };
+    }),
+  };
 }
 function redactLLM(cfg) {
   return { providers: (cfg.providers || []).map((p) => ({ ...p, apiKey: p.apiKey ? '***' : '' })) };
@@ -421,7 +428,8 @@ async function handleApi(req, res, pathname, query) {
     let lastErr = null;
     for (const p of llmCfg.providers) {
       const baseUrl = (p.baseUrl || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
-      const apiKey = p.apiKey || process.env.OPENROUTER_API_KEY || '';
+      const isVenice = baseUrl.includes('venice.ai');
+      const apiKey = p.apiKey || (isVenice ? process.env.VENICE_API_KEY : process.env.OPENROUTER_API_KEY) || '';
       if (!apiKey) { lastErr = 'Missing API key for ' + p.model; continue; }
       let llmRes;
       try {
