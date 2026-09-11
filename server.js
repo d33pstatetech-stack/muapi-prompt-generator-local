@@ -502,11 +502,16 @@ async function handleApi(req, res, pathname, query) {
     const systemPrompt = buildEnhancerSystemPrompt(rawPrompt, ctx);
     const llmCfg = getLLMConfigLocal();
     let lastErr = null;
+    const tried = [];
+    const noteFail = (model, base, msg) => {
+      lastErr = msg;
+      tried.push(`${model} @ ${base} → ${String(msg).slice(0, 220)}`);
+    };
     for (const p of llmCfg.providers) {
       const baseUrl = (p.baseUrl || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
       const isVenice = baseUrl.includes('venice.ai');
       const apiKey = p.apiKey || (isVenice ? process.env.VENICE_API_KEY : process.env.OPENROUTER_API_KEY) || '';
-      if (!apiKey) { lastErr = 'Missing API key for ' + p.model; continue; }
+      if (!apiKey) { noteFail(p.model, baseUrl, 'Missing API key'); continue; }
       // Fail-fast: 12s abort for initial connect, no retry per model (single try)
       const ctrl = new AbortController();
       const to = setTimeout(() => ctrl.abort(), 12000);
@@ -526,7 +531,7 @@ async function handleApi(req, res, pathname, query) {
         clearTimeout(to);
       } catch (e) {
         clearTimeout(to);
-        lastErr = e.name === 'AbortError' ? `Timeout 12s for ${p.model} @ ${baseUrl}` : e.message;
+        noteFail(p.model, baseUrl, e.name === 'AbortError' ? `Timeout 12s` : e.message);
         continue;
       }
       if (!llmRes.ok) {
@@ -535,7 +540,7 @@ async function handleApi(req, res, pathname, query) {
         const msg = (j && (j.error?.message || j.error)) || txt || `HTTP ${llmRes.status}`;
         // Fast-path for content filtering / policy refusal — immediately try next provider
         const isFilter = /content_filter|policy|refusal|blocked by|filtered/i.test(msg) || j?.error?.code === 'content_filter';
-        lastErr = msg + (isFilter ? ' [content_filter → trying next provider]' : '');
+        noteFail(p.model, baseUrl, msg + (isFilter ? ' [content_filter → trying next provider]' : ''));
         // No retry to same model — continue to next provider immediately
         continue;
       }
@@ -544,11 +549,11 @@ async function handleApi(req, res, pathname, query) {
         try {
           const j = await llmRes.json();
           const content = j.choices?.[0]?.message?.content || j.choices?.[0]?.delta?.content || '';
-          if (!content) { lastErr = 'Empty LLM response'; continue; }
+          if (!content) { noteFail(p.model, baseUrl, 'Empty LLM response'); continue; }
           const techniques = deriveTechniques(content, ctx);
           try { const arr = loadPrompts(); arr.unshift({ id: Date.now(), kind: isOptimize ? 'optimized' : 'enhanced', prompt: rawPrompt, enhanced: content, model_id: model.id, params_json: JSON.stringify(userParams), llm_provider: baseUrl, llm_model: p.model, created_at: new Date().toISOString() }); savePrompts(arr); } catch {}
           return json(res, { optimized_prompt: content, enhanced: content, techniques_applied: techniques, providerUsed: baseUrl, modelUsed: p.model, ctx });
-        } catch (e) { lastErr = e.message; continue; }
+        } catch (e) { noteFail(p.model, baseUrl, e.message); continue; }
       }
       // Stream to client
       res.writeHead(200, {
@@ -590,7 +595,7 @@ async function handleApi(req, res, pathname, query) {
       }
       return;
     }
-    return json(res, { error: 'All LLM providers failed', message: String(lastErr || 'unknown') }, 502);
+    return json(res, { error: 'All LLM providers failed', message: String(lastErr || 'unknown'), providersTried: tried, modelId: model.id }, 502);
   }
 
   // Prompts list
