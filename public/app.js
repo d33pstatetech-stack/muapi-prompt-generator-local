@@ -545,6 +545,22 @@ async function updateCostEstimate() {
   // TODO: call /api/estimate for dynamic pricing models
 }
 
+// ── Error text helper: MuAPI nests reasons as objects ({code,message}).
+// String(obj) renders "[object Object]" — extract or serialize instead.
+function errText(v, fallback){
+  if (typeof v === 'string' && v) return v;
+  if (v && typeof v === 'object') {
+    if (typeof v.message === 'string' && v.message) return v.message;
+    if (typeof v.error === 'string' && v.error) return v.error;
+    if (v.error && typeof v.error === 'object') {
+      const inner = errText(v.error, '');
+      if (inner) return inner;
+    }
+    try { return JSON.stringify(v).slice(0, 500); } catch { return fallback; }
+  }
+  return fallback;
+}
+
 // ── Generate ──
 async function generate() {
   if (!currentModel) return;
@@ -574,14 +590,14 @@ async function generate() {
     });
     const data = await res.json();
     if (!res.ok) {
-      const errMsg = data.message || data.error || data.details?.detail || `Generation failed (${res.status})`;
+      const errMsg = errText(data.message, '') || errText(data.error, '') || errText(data.details?.detail, '') || `Generation failed (${res.status})`;
       throw new Error(errMsg);
     }
 
     showStatus('Processing...', `ID: ${data.requestId}`, true);
     pollForResult(data.requestId, data.cost);
   } catch (e) {
-    showStatus('Error', e.message, false);
+    showStatus('Error', `${e.message} [model: ${currentModel?.id || 'none'}]`, false);
     btn.disabled = false;
     btnText.classList.remove('hidden');
     btnSpin.classList.add('hidden');
@@ -606,7 +622,7 @@ function pollForResult(requestId, initialCost) {
         resetGenButton();
       } else if (data.status === 'failed') {
         clearInterval(pollTimer);
-        showStatus('Failed', data.error || 'Generation failed', false);
+        showStatus('Failed', `${errText(data.error, 'Generation failed')} [id: ${requestId} | model: ${currentModel?.id || 'unknown'}]`, false);
         resetGenButton();
       } else {
         const pct = data.status === 'processing' ? 60 : data.status === 'queued' ? 20 : 40;
