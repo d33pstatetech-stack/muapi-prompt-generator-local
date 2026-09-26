@@ -182,6 +182,28 @@ const MIME = {
   '.woff2': 'font/woff2',
 };
 
+// Repos the /api/hf/file proxy is permitted to serve. Configured as a
+// comma-separated list of exact `owner/repo` entries or `owner/*` wildcards.
+// Empty (the default) denies everything.
+function hfProxyAllowlist() {
+  return String(process.env.HF_PROXY_REPO_ALLOWLIST || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => /^[A-Za-z0-9._-]+\/([A-Za-z0-9._-]+|\*)$/.test(s));
+}
+
+function hfRepoAllowedIn(allow, repo) {
+  if (!allow || !allow.length) return false;
+  return allow.some((entry) => {
+    if (entry.endsWith('/*')) return repo.startsWith(entry.slice(0, -1));
+    return entry === repo;
+  });
+}
+
+function hfRepoAllowed(repo) {
+  return hfRepoAllowedIn(hfProxyAllowlist(), repo);
+}
+
 function json(res, data, status = 200) {
   const body = JSON.stringify(data);
   res.writeHead(status, {
@@ -306,7 +328,20 @@ async function handleApi(req, res, pathname, query) {
   if (pathname === '/api/hf/file' && req.method === 'GET') {
     const repo = query.get('repo');
     const file = query.get('file') || 'pytorch_lora_weights.safetensors';
-    if (!repo) return json(res, { error: 'repo query param required, e.g. ?repo=D33pStateTech/d33pstateten&file=pytorch_lora_weights.safetensors' }, 400);
+    if (!repo) return json(res, { error: 'repo query param required, e.g. ?repo=owner/repo&file=pytorch_lora_weights.safetensors' }, 400);
+    if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(repo)) {
+      return json(res, { error: 'repo must be in owner/repo form' }, 400);
+    }
+    // Allowlist: this endpoint has to be reachable without credentials so an
+    // upstream fetcher can pull private weights, which means an open proxy would
+    // spend this machine's HF token on arbitrary files. Only repos named in
+    // HF_PROXY_REPO_ALLOWLIST are served. Unset means deny.
+    if (!hfRepoAllowed(repo)) {
+      return json(res, { error: 'repo not allowlisted', hint: 'add it to HF_PROXY_REPO_ALLOWLIST in .env (comma-separated owner/repo or owner/*)' }, 403);
+    }
+    if (/[/\\]/.test(file) || file.includes('..')) {
+      return json(res, { error: 'invalid file param' }, 400);
+    }
     const hfUrl = `https://huggingface.co/${repo}/resolve/main/${file}`;
     const headers = {};
     const hfToken = process.env.HUGGINGFACE_API_KEY || '';
@@ -344,20 +379,28 @@ async function handleApi(req, res, pathname, query) {
     if (!model) return json(res, { error: 'Model not found in catalog' }, 404);
 
     let apiBody = buildApiBody(modelId, userParams || {});
-    // Auto-rewrite private HF LoRA URLs to proxied local URLs so MuAPI can fetch without HF auth
+    // Auto-rewrite HuggingFace URLs to proxied local URLs so MuAPI can fetch them
+    // without HF auth. Only repos on the allowlist qualify; everything else is
+    // passed through untouched.
     try {
-      const hfToken = process.env.HUGGINGFACE_API_KEY || '';
-      if (hfToken && JSON.stringify(apiBody).includes('huggingface.co/D33pStateTech/d33pstateten')) {
-        const origin = `http://${req.headers.host || 'localhost:' + PORT}`;
-        const proxied = JSON.stringify(apiBody)
-          .replace(/https:\/\/huggingface\.co\/D33pStateTech\/d33pstateten[^"]*/g, (m) => {
-            let file = 'pytorch_lora_weights.safetensors';
-            const mm = m.match(/\/resolve\/main\/([^"?]+)/);
-            if (mm) file = mm[1];
-            return `${origin}/api/hf/file?repo=D33pStateTech/d33pstateten&file=${encodeURIComponent(file)}`;
-          })
-          .replace(/huggingface\.co\/D33pStateTech\/d33pstateten(?!\/resolve)/g, origin + '/api/hf/file?repo=D33pStateTech/d33pstateten&file=pytorch_lora_weights.safetensors');
-        apiBody = JSON.parse(proxied);
+      const allow = hfProxyAllowlist();
+      if (process.env.HUGGINGFACE_API_KEY && allow.length) {
+        const bodyStr = JSON.stringify(apiBody);
+        if (/huggingface\.co\//.test(bodyStr)) {
+          const origin = `http://${req.headers.host || 'localhost:' + PORT}`;
+          const proxied = bodyStr
+            .replace(/https?:\/\/huggingface\.co\/([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)(\/resolve\/[^"?]+)?/g, (m, repo, tail) => {
+              if (!hfRepoAllowedIn(allow, repo)) return m;
+              const file = (tail || '').replace(/^\/resolve\/[^/]+\//, '') || 'pytorch_lora_weights.safetensors';
+              return `${origin}/api/hf/file?repo=${encodeURIComponent(repo)}&file=${encodeURIComponent(file)}`;
+            })
+            .replace(/(?<!https:\/\/)huggingface\.co\/([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)(?!\/resolve)/g, (m, repo) => (
+              hfRepoAllowedIn(allow, repo)
+                ? `${origin}/api/hf/file?repo=${encodeURIComponent(repo)}&file=pytorch_lora_weights.safetensors`
+                : m
+            ));
+          if (proxied !== bodyStr) apiBody = JSON.parse(proxied);
+        }
       }
     } catch (e) { console.error('HF rewrite failed', e.message); }
 
@@ -523,7 +566,7 @@ async function handleApi(req, res, pathname, query) {
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${apiKey}`,
-            'HTTP-Referer': 'http://localhost:3000',
+            'HTTP-Referer': process.env.HF_PROXY_BASE_URL || `http://${req.headers.host || 'localhost:' + PORT}`,
             'X-Title': 'MuAPI Prompt Generator Local',
           },
           body: JSON.stringify({ model: p.model, stream: !wantsJson, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: `Raw prompt: """${rawPrompt}"""` }] }),
