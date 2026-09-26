@@ -379,26 +379,25 @@ async function handleApi(req, res, pathname, query) {
     if (!model) return json(res, { error: 'Model not found in catalog' }, 404);
 
     let apiBody = buildApiBody(modelId, userParams || {});
-    // Auto-rewrite HuggingFace URLs to proxied local URLs so MuAPI can fetch them
-    // without HF auth. Only repos on the allowlist qualify; everything else is
-    // passed through untouched.
+    // Route HuggingFace URLs through this server so MuAPI can fetch weights it
+    // cannot reach itself. Empty allowlist (the default) means no rewriting at
+    // all: public adapters are passed through and MuAPI fetches them from the
+    // Hub directly. Only the /resolve/main/<file> form is rewritten, since the
+    // bare owner/repo form carries no filename to request.
     try {
       const allow = hfProxyAllowlist();
       if (process.env.HUGGINGFACE_API_KEY && allow.length) {
         const bodyStr = JSON.stringify(apiBody);
-        if (/huggingface\.co\//.test(bodyStr)) {
+        if (/huggingface\.co\/[^"']*\/resolve\//.test(bodyStr)) {
           const origin = `http://${req.headers.host || 'localhost:' + PORT}`;
-          const proxied = bodyStr
-            .replace(/https?:\/\/huggingface\.co\/([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)(\/resolve\/[^"?]+)?/g, (m, repo, tail) => {
-              if (!hfRepoAllowedIn(allow, repo)) return m;
-              const file = (tail || '').replace(/^\/resolve\/[^/]+\//, '') || 'pytorch_lora_weights.safetensors';
-              return `${origin}/api/hf/file?repo=${encodeURIComponent(repo)}&file=${encodeURIComponent(file)}`;
-            })
-            .replace(/(?<!https:\/\/)huggingface\.co\/([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)(?!\/resolve)/g, (m, repo) => (
+          const proxied = bodyStr.replace(
+            /https?:\/\/huggingface\.co\/([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)\/resolve\/[^/]+\/([^"?]+)/g,
+            (m, repo, file) => (
               hfRepoAllowedIn(allow, repo)
-                ? `${origin}/api/hf/file?repo=${encodeURIComponent(repo)}&file=pytorch_lora_weights.safetensors`
+                ? `${origin}/api/hf/file?repo=${encodeURIComponent(repo)}&file=${encodeURIComponent(file)}`
                 : m
-            ));
+            ),
+          );
           if (proxied !== bodyStr) apiBody = JSON.parse(proxied);
         }
       }
