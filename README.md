@@ -151,7 +151,7 @@ localhost. Do not expose this port.
 | `OPENROUTER_API_KEY` | for enhancer | — |
 | `VENICE_API_KEY` | optional, alternative provider | — |
 | `HUGGINGFACE_API_KEY` | for the private LoRA proxy | — |
-| `HF_PROXY_REPO_ALLOWLIST` | no | empty (deny all) |
+| `HF_PROXY_REPO_ALLOWLIST` | no | empty (deny all) — set to your HF owner, e.g. `your-hf-user/*` |
 | `HF_PROXY_BASE_URL` | no | the request's own host |
 
 ---
@@ -159,20 +159,26 @@ localhost. Do not expose this port.
 ## Private LoRA proxy
 
 `GET /api/hf/file?repo=owner/repo&file=…` serves a Hugging Face file using
-`HUGGINGFACE_API_KEY`, so a private LoRA can be referenced by URL without the key
-ever appearing in a LoRA field. When a generation is submitted, any allowlisted
-Hugging Face URL in the payload is rewritten to point at this local endpoint so
-MuAPI's servers can fetch it.
+`HUGGINGFACE_API_KEY`, so a **private** LoRA can be referenced by URL without the
+key ever appearing in a LoRA field. When a generation is submitted, any
+allowlisted Hugging Face URL in the payload is rewritten to point at this local
+endpoint so MuAPI's servers can fetch it.
 
-The endpoint has to be reachable without credentials for that to work, which is
-exactly why it is allowlisted. An open proxy would let anything on the network
-spend this machine's Hugging Face token to download arbitrary files, so
-`HF_PROXY_REPO_ALLOWLIST` is empty by default and only exact `owner/repo` entries
-or `owner/*` wildcards are honoured:
+**This does not restrict which LoRAs you can use.** A repo that is not on the
+list has its URL passed through untouched, and MuAPI fetches it from the Hub
+directly and anonymously — that is the normal path for every public adapter, and
+it is unaffected by the setting. The allowlist only decides which repos this
+server will fetch *on MuAPI's behalf* using your token, which is what private or
+gated repos require.
+
+The endpoint must be reachable without credentials for that to work, which is
+exactly why it is allowlisted: an open proxy would let anything reaching this
+port spend your Hugging Face token on arbitrary downloads. So the list is closed
+by default and only exact `owner/repo` entries or `owner/*` wildcards pass:
 
 ```bash
-# .env
-HF_PROXY_REPO_ALLOWLIST=my-hf-user/some-private-lora,my-hf-user/*
+# .env — a wildcard covers every repo you own, including any added later
+HF_PROXY_REPO_ALLOWLIST=D33pStateTech/*
 ```
 
 Weight downloads are proxied without `Range` support in this build, so large files
@@ -221,9 +227,12 @@ The LoRA picker keeps uncensored and adult-oriented adapters in a separate bucke
 (`NSFW_LORAS` in `public/loras.js`) so the default view stays clean. Those are
 ordinary public community checkpoints; the only thing distinguishing them is
 which list they appear in, and they are handled identically to any other adapter.
-The curated list alongside them is public community adapters spanning FLUX.1,
-Qwen-Image, Krea, and Wan 2.1, one per family the compatibility filter
-understands.
+
+`public/loras.js` holds three lists that share one shape: `USER_LORAS` (the
+default picker view — public community adapters plus the maintainer's own trained
+adapters, one per family the compatibility filter understands across FLUX.1,
+Qwen-Image, Krea, and Wan 2.1) and `NSFW_LORAS`. All of it is plain data, safe to
+edit or extend.
 
 Use of any adapter is subject to the licence of the individual checkpoint and to
 the terms of the service actually generating the output.
